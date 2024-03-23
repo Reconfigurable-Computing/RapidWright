@@ -46,6 +46,7 @@ import java.util.Collection;
 import java.util.EnumMap;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.Iterator;
 import java.util.List;
@@ -53,6 +54,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.StreamSupport;
 
 /**
  * Encapsulation of RWRoute's routing resource graph.
@@ -78,6 +80,10 @@ public class RouteNodeGraph {
      * asyncPreserve()
      */
     private final CountUpDownLatch asyncPreserveOutstanding;
+
+    private final CountUpDownLatch syncRnodeCountLatch;
+
+    private final CountUpDownLatch mergeRnodeCountLatch;
 
     /**
      * Visited rnodes data during connection routing
@@ -112,6 +118,9 @@ public class RouteNodeGraph {
      */
     protected final boolean lutRoutethru;
 
+    /** Route boundary of this graph */
+    private short[] boundary;
+
     protected class RouteNodeImpl extends RouteNode {
         protected RouteNodeImpl(Node node, RouteNodeType type) {
             super(node, type, lagunaI);
@@ -138,7 +147,7 @@ public class RouteNodeGraph {
 
         @Override
         public RouteNode[] getChildren() {
-            setChildren(setChildrenTimer);
+            setChildren(setChildrenTimer, boundary, lagunaI);
             return super.getChildren();
         }
 
@@ -152,13 +161,16 @@ public class RouteNodeGraph {
         this.design = design;
         lutRoutethru = config.isLutRoutethru();
 
-        nodesMap = new HashMap<>();
+        nodesMap = new ConcurrentHashMap<>();
         nodesMapSize = 0;
         preservedMap = new ConcurrentHashMap<>();
         preservedMapSize = new AtomicInteger();
         asyncPreserveOutstanding = new CountUpDownLatch();
+        syncRnodeCountLatch = new CountUpDownLatch();
+        mergeRnodeCountLatch = new CountUpDownLatch();
         targets = new ArrayList<>();
         this.setChildrenTimer = setChildrenTimer;
+        this.boundary = null;
 
         Device device = design.getDevice();
         intYToSLRIndex = new int[device.getRows()];
@@ -176,7 +188,7 @@ public class RouteNodeGraph {
         accessibleWireOnlyIfAboveBelowTarget = new EnumMap<>(TileTypeEnum.class);
         BitSet wires = new BitSet();
         Tile intTile = device.getArbitraryTileOfType(TileTypeEnum.INT);
-        // Device.getArbitraryTileOfType() typically gives you the North-Western-most
+        // Device.getArbitraryTileOfType() typically gives you the North-Eastern-most
         // tile (with minimum X, maximum Y). Analyze the tile just below that.
         intTile = intTile.getTileXYNeighbor(0, -1);
         for (int wireIndex = 0; wireIndex < intTile.getWireCount(); wireIndex++) {
@@ -312,6 +324,157 @@ public class RouteNodeGraph {
             prevLagunaColumn = null;
             lagunaI = null;
         }
+    }
+
+    public RouteNodeGraph(RouteNodeGraph graph, short[] boundary) {
+        design = graph.getDesign();
+        lutRoutethru = graph.getLutRoutethru();
+        nodesMap = new ConcurrentHashMap<>();
+        nodesMapSize = 0;
+        preservedMap = new ConcurrentHashMap<>();
+        preservedMap.putAll(graph.getPreservedMap());
+        preservedMapSize = new AtomicInteger();
+        preservedMapSize.set(graph.getPreservedMapSize());
+        asyncPreserveOutstanding = new CountUpDownLatch();
+        syncRnodeCountLatch = new CountUpDownLatch();
+        mergeRnodeCountLatch = new CountUpDownLatch();
+        targets = new ArrayList<>();
+        setChildrenTimer = graph.getSetChildTimer();
+        intYToSLRIndex = graph.getIntYToSLRIndex();
+        nextLagunaColumn = graph.nextLagunaColumn;
+        prevLagunaColumn = graph.prevLagunaColumn;
+        lagunaI = new IdentityHashMap<>();
+        lagunaI.putAll(graph.getLagunaI());
+        if (graph.getAccessibleWireOnlyIfAboveBelowTarget() != null) {
+            accessibleWireOnlyIfAboveBelowTarget = new EnumMap<>(TileTypeEnum.class);
+            accessibleWireOnlyIfAboveBelowTarget.putAll(graph.getAccessibleWireOnlyIfAboveBelowTarget());
+        } else {
+            accessibleWireOnlyIfAboveBelowTarget = null;
+        }
+        if (graph.getMuxWires() != null) {
+            muxWires = new EnumMap<>(TileTypeEnum.class);
+            muxWires.putAll(graph.getMuxWires());
+        } else {
+            muxWires = null;
+        }
+        this.boundary = boundary;
+    }
+
+    public Design getDesign() {
+        return design;
+    }
+
+    public boolean getLutRoutethru() {
+        return lutRoutethru;
+    }
+
+    public Map<Tile, RouteNode[]> getNodesMap() {
+        return nodesMap;
+    }
+
+    public int getNodesMapSize() {
+        return nodesMapSize;
+    }
+
+    public Map<Tile, Net[]> getPreservedMap() {
+        return preservedMap;
+    }
+
+    public int getPreservedMapSize() {
+        return preservedMapSize.get();
+    }
+
+    public RuntimeTracker getSetChildTimer() {
+        return setChildrenTimer;
+    }
+
+    public int getSLRIndex(RouteNode rnode) {
+        return intYToSLRIndex[rnode.getEndTileYCoordinate()];
+    }
+
+    public int[] getIntYToSLRIndex() {
+        return intYToSLRIndex;
+    }
+
+    public Map<Tile, BitSet> getLagunaI() {
+        return lagunaI;
+    }
+
+    public Map<TileTypeEnum, BitSet> getAccessibleWireOnlyIfAboveBelowTarget() {
+        return accessibleWireOnlyIfAboveBelowTarget;
+    }
+
+    public Map<TileTypeEnum, BitSet> getMuxWires() {
+        return muxWires;
+    }
+
+    public short[] getBoundary() {
+        return boundary;
+    }
+
+    public void setBoundary(short[] boundary) {
+        this.boundary = boundary;
+    }
+
+    public void mergeGraph(RouteNodeGraph graph) {
+        StreamSupport.stream(graph.getRnodes().spliterator(), true).forEach((connection) -> {
+            mergeRnode(connection);
+        });;
+    }
+
+    public void mergeRnodeAsync(RouteNode rnode) {
+        mergeRnodeCountLatch.countUp();
+        ParallelismTools.submit(() -> {
+            try {
+                mergeRnode(rnode);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            } finally {
+                mergeRnodeCountLatch.countDown();
+            }
+        });
+    }
+
+    public void mergeRnodeAwait() {
+        mergeRnodeCountLatch.await();
+    }
+
+    private void mergeRnode(RouteNode rnode) {
+        RouteNode thisRnode = getOrCreate(rnode.getNode(), rnode.getType());
+        thisRnode.updateFrom(rnode, this);
+    }
+
+    public void syncGraph(RouteNodeGraph graph) {
+        StreamSupport.stream(graph.getRnodes().spliterator(), true).forEach((connection) -> {
+            syncRnode(connection);
+        });
+    }
+
+    public void syncRnodeAsync(RouteNode rnode) {
+        syncRnodeCountLatch.countUp();
+        ParallelismTools.submit(() -> {
+            try {
+                syncRnode(rnode);
+            } catch (Throwable t) {
+                t.printStackTrace();
+            } finally {
+                syncRnodeCountLatch.countDown();
+            }
+        });
+    }
+
+    public void syncRnodeAwait() {
+        syncRnodeCountLatch.await();
+    }
+
+    private void syncRnode(RouteNode rnode) {
+        short x = rnode.getEndTileXCoordinate();
+        short y = rnode.getEndTileYCoordinate();
+        if (x < boundary[0] || x >= boundary[1] || y < boundary[2] || y >= boundary[3]) {
+            return;
+        }
+        RouteNode thisRnode = getOrCreate(rnode.getNode(), rnode.getType());
+        thisRnode.updateFrom(rnode, this);
     }
 
     public void initialize() {

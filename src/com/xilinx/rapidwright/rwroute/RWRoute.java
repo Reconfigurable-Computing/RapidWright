@@ -24,6 +24,7 @@
 
 package com.xilinx.rapidwright.rwroute;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
@@ -33,9 +34,12 @@ import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Semaphore;
 import java.util.PriorityQueue;
 import java.util.Set;
 import java.util.function.Function;
@@ -67,8 +71,10 @@ import com.xilinx.rapidwright.timing.TimingManager;
 import com.xilinx.rapidwright.timing.TimingVertex;
 import com.xilinx.rapidwright.timing.delayestimator.DelayEstimatorBase;
 import com.xilinx.rapidwright.timing.delayestimator.InterconnectInfo;
+import com.xilinx.rapidwright.util.CountUpDownLatch;
 import com.xilinx.rapidwright.util.MessageGenerator;
 import com.xilinx.rapidwright.util.Pair;
+import com.xilinx.rapidwright.util.ParallelismTools;
 import com.xilinx.rapidwright.util.RuntimeTracker;
 import com.xilinx.rapidwright.util.RuntimeTrackerTree;
 import com.xilinx.rapidwright.util.Utils;
@@ -135,10 +141,12 @@ public class RWRoute{
     private Set<RouteNode> overUsedRnodes;
     /** Class encapsulating the routing resource graph */
     protected RouteNodeGraph routingGraph;
+    /** Semaphore of routing resource graph */
+    protected Semaphore routingGraphSem;
     /** Count of rnodes created in the current routing iteration */
     protected long rnodesCreatedThisIteration;
     /** The queue to store candidate nodes to route a connection */
-    private PriorityQueue<RouteNode> queue;
+    // private PriorityQueue<RouteNode> queue;
 
     /** Total wirelength of the routed design */
     private int totalWL;
@@ -149,12 +157,12 @@ public class RWRoute{
     /** A map from node types to the total wirelength of used nodes of the types */
     private Map<IntentCode, Long> nodeTypeLength;
     /** The total number of connections that are routed */
-    protected int connectionsRouted;
+    protected volatile int connectionsRouted;
     /** The total number of connections routed in an iteration */
-    private int connectionsRoutedIteration;
+    private volatile int connectionsRoutedIteration;
     /** Total number of nodes pushed/popped from the queue */
-    private long nodesPushed;
-    private long nodesPopped;
+    private volatile long nodesPushed;
+    private volatile long nodesPopped;
 
     /** The maximum criticality constraint of connection */
     private static final float MAX_CRITICALITY = 0.99f;
@@ -171,6 +179,9 @@ public class RWRoute{
 
     /** A map storing routes from CLK_OUT to different INT tiles that connect to sink pins of a global clock net */
     protected Map<String, List<String>> routesToSinkINTTiles;
+
+    /** Partition iteration count */
+    private int pIter = 4;
 
     public static final EnumSet<Series> SUPPORTED_SERIES;
 
@@ -221,8 +232,9 @@ public class RWRoute{
         minRerouteCriticality = config.getMinRerouteCriticality();
         criticalConnections = new ArrayList<>();
 
-        queue = new PriorityQueue<>();
+        // queue = new PriorityQueue<>();
         routingGraph = createRouteNodeGraph();
+        routingGraphSem = new Semaphore(1);
         if (config.isTimingDriven()) {
             nodesDelays = new HashMap<>();
         }
@@ -482,8 +494,7 @@ public class RWRoute{
 
         List<SitePinInst> gndPins = staticNetAndRoutingTargets.get(design.getGndNet());
         if (gndPins != null) {
-            boolean invertGndToVccForLutInputs = config.isInvertGndToVccForLutInputs();
-            Set<SitePinInst> newVccPins = RouterHelper.invertPossibleGndPinsToVccPins(design, gndPins, invertGndToVccForLutInputs);
+            Set<SitePinInst> newVccPins = RouterHelper.invertPossibleGndPinsToVccPins(design, gndPins);
             if (!newVccPins.isEmpty()) {
                 gndPins.removeAll(newVccPins);
                 staticNetAndRoutingTargets.computeIfAbsent(design.getVccNet(), (net) -> new ArrayList<>())
@@ -505,28 +516,6 @@ public class RWRoute{
             GlobalSignalRouting.routeStaticNet(staticNet, gns, design, routethruHelper);
 
             preserveNet(staticNet, false);
-
-            // When a [A-H]MUX pin is used as a static source, also preserve the [A-H]_O pin
-            // so that it can't be used by other static nets, nor as a LUT routethru
-            for (SitePinInst spi : staticNet.getPins()) {
-                if (!spi.isOutPin()) {
-                    continue;
-                }
-
-                SiteInst si = spi.getSiteInst();
-                if (!Utils.isSLICE(si)) {
-                    continue;
-                }
-
-                String pinName = spi.getName();
-                if (pinName.endsWith("MUX")) {
-                    char lutLetter = pinName.charAt(0);
-                    Node oNode = si.getSite().getConnectedNode(lutLetter + "_O");
-                    routingGraph.preserve(oNode, staticNet);
-                } else {
-                    assert(pinName.endsWith("_O"));
-                }
-            }
         }
     }
 
@@ -550,38 +539,35 @@ public class RWRoute{
      * @return A {@link NetWrapper} instance.
      */
     protected NetWrapper createNetWrapperAndConnections(Net net) {
-        List<SitePinInst> sinkPins = net.getSinkPins();
-        assert(!sinkPins.isEmpty());
-
         NetWrapper netWrapper = new NetWrapper(numWireNetsToRoute++, net);
         NetWrapper existingNetWrapper = nets.put(net, netWrapper);
         assert(existingNetWrapper == null);
-
         SitePinInst source = net.getSource();
-        Node sourceINTNode = RouterHelper.projectOutputPinToINTNode(source);
-
-        // Pre-emptively set up alternate source since we may expand from both sources
-        SitePinInst altSource = net.getAlternateSource();
-        Node altSourceINTNode = null;
-        if (altSource == null) {
-            altSource = DesignTools.getLegalAlternativeOutputPin(net);
-            if (altSource != null) {
-                // Add this SitePinInst to the net, but not to the SiteInst since it's not yet clear we'll be using it
-                net.addPin(altSource);
-                DesignTools.routeAlternativeOutputSitePin(net, altSource);
-            }
-        }
-        if (altSource != null) {
-            assert(!altSource.equals(source));
-            altSourceINTNode = RouterHelper.projectOutputPinToINTNode(altSource);
-        }
-
+        int indirect = 0;
         RouteNode sourceINTRnode = null;
         RouteNode altSourceINTRnode = null;
-        int indirect = 0;
-        for (SitePinInst sink : sinkPins) {
+
+        for (SitePinInst sink : net.getSinkPins()) {
             Connection connection = new Connection(numConnectionsToRoute++, source, sink, netWrapper);
+
             List<Node> nodes = RouterHelper.projectInputPinToINTNode(sink);
+            Node sourceINTNode = RouterHelper.projectOutputPinToINTNode(source);
+            // Pre-emptively set up alternate source since we may expand from both sources
+            SitePinInst altSource = net.getAlternateSource();
+            if (altSource == null) {
+                altSource = DesignTools.getLegalAlternativeOutputPin(net);
+                if (altSource != null) {
+                    // Add this SitePinInst to the net, but not to the SiteInst
+                    net.addPin(altSource);
+                    DesignTools.routeAlternativeOutputSitePin(net, altSource);
+                }
+            }
+
+            Node altSourceINTNode = null;
+            if (altSource != null) {
+                assert(!altSource.equals(source));
+                altSourceINTNode = RouterHelper.projectOutputPinToINTNode(altSource);
+            }
 
             if (nodes.isEmpty() || (sourceINTNode == null && altSourceINTNode == null)) {
                 directConnections.add(connection);
@@ -652,16 +638,18 @@ public class RWRoute{
                     sinkRnode.updatePresentCongestionCost(presentCongestionFactor);
                 }
 
-                if (sourceINTNode == null && altSourceINTNode == null) {
-                    throw new RuntimeException("ERROR: Null projected INT node for the source of net " + net.toStringFull());
-                }
-                if (sourceINTRnode == null && sourceINTNode != null) {
-                    sourceINTRnode = getOrCreateRouteNode(sourceINTNode, RouteNodeType.PINFEED_O);
-                }
-                if (altSourceINTRnode == null && altSourceINTNode != null) {
-                    altSourceINTRnode = getOrCreateRouteNode(altSourceINTNode, RouteNodeType.PINFEED_O);
-                }
+                if (sourceINTRnode == null && altSourceINTRnode == null) {
+                    if (sourceINTNode != null) {
+                        sourceINTRnode = getOrCreateRouteNode(sourceINTNode, RouteNodeType.PINFEED_O);
+                    }
+                    if (altSourceINTNode != null) {
+                        altSourceINTRnode = getOrCreateRouteNode(altSourceINTNode, RouteNodeType.PINFEED_O);
+                    }
 
+                    if (sourceINTRnode == null && altSourceINTRnode == null) {
+                        throw new RuntimeException("ERROR: Null projected INT node for the source of net " + net.toStringFull());
+                    }
+                }
                 if (sourceINTRnode != null) {
                     connection.setSourceRnode(sourceINTRnode);
                     connection.setAltSourceRnode(altSourceINTRnode);
@@ -727,8 +715,8 @@ public class RWRoute{
      */
     private void initializeRouting() {
         routingGraph.initialize();
-        queue.clear();
-        routeIteration = 1;
+        // queue.clear();
+        routeIteration = 0;
         historicalCongestionFactor = config.getHistoricalCongestionFactor();
         presentCongestionFactor = config.getInitialPresentCongestionFactor();
         timingWeight = config.getTimingWeight();
@@ -844,13 +832,273 @@ public class RWRoute{
     }
 
     /**
+     * Determine whether a point is out of boundary.
+     * @return Whether the point is out of boundary.
+     */
+    public boolean isOutOfBoundary(short[] boundary, int x, int y) {
+        return x < boundary[0] || x >= boundary[1] || y < boundary[2] || y >= boundary[3];
+    }
+
+    /**
+     * Get design boundary.
+     * @return The boundary of design.
+     */
+    public short[] getDesignBoundary() {
+        short xMin = Short.MAX_VALUE;
+        short xMax = Short.MIN_VALUE;
+        short yMin = Short.MAX_VALUE;
+        short yMax = Short.MIN_VALUE;
+
+        for (Connection connection : indirectConnections) {
+            xMin = (short)Math.min(xMin, connection.getXMinBB());
+            xMax = (short)Math.max(xMax, connection.getXMaxBB());
+            yMin = (short)Math.min(yMin, connection.getYMinBB());
+            yMax = (short)Math.max(yMax, connection.getYMaxBB());
+        }
+
+        return new short[] {xMin, xMax, yMin, yMax};
+    }
+
+    /**
+     * Get device boundary.
+     * @return The boundary of device.
+     */
+    public short[] getDeviceBoundary() {
+        return new short[] {0, 108, 0, 300};
+    }
+
+    private Integer[] prevSumX;
+    private Integer[] prevSumY;
+
+    public void summaryConnectionPos(List<Connection> connections) {
+        short[] deviceBoundary = getDeviceBoundary();
+
+        prevSumX = Collections.nCopies(deviceBoundary[1] + 1, Integer.valueOf(0)).stream().toArray(Integer[]::new);
+        prevSumY = Collections.nCopies(deviceBoundary[3] + 1, Integer.valueOf(0)).stream().toArray(Integer[]::new);
+
+        for (Connection connection : connections) {
+            for (int x = connection.getXMaxBB(); x <= deviceBoundary[1]; x++) {
+                prevSumX[x]++;
+            }
+            for (int y = connection.getYMaxBB(); y <= deviceBoundary[3]; y++) {
+                prevSumY[y]++;
+            }
+        }
+    }
+
+    public List<short[]> partitionByLoadBalance(short[] boundary, boolean vertical) {
+        List<short[]> partitionedBoundary = new ArrayList<>();
+
+        if (vertical) {
+            int minDiffPos = -1;
+            int minDiffVal = Integer.MAX_VALUE;
+            short xMin = boundary[0];
+            short xMax = boundary[1];
+            short yMin = boundary[2];
+            short yMax = boundary[3];
+            for (int x = xMin; x <= xMax; x++) {
+                int diff = Math.abs((prevSumX[x] - prevSumX[xMin]) - (prevSumX[xMax] - prevSumX[x]));
+                if (minDiffVal > diff) {
+                    minDiffVal = diff;
+                    minDiffPos = x;
+                }
+            }
+            partitionedBoundary.add(new short[] { xMin, (short) minDiffPos, yMin, yMax });
+            partitionedBoundary.add(new short[] { (short) minDiffPos, xMax, yMin, yMax });
+        } else {
+            int minDiffPos = -1;
+            int minDiffVal = Integer.MAX_VALUE;
+            short xMin = boundary[0];
+            short xMax = boundary[1];
+            short yMin = boundary[2];
+            short yMax = boundary[3];
+            for (int y = yMin; y <= yMax; y++) {
+                int diff = Math.abs((prevSumY[y] - prevSumY[yMin]) - (prevSumY[yMax] - prevSumY[y]));
+                if (minDiffVal > diff) {
+                    minDiffVal = diff;
+                    minDiffPos = y;
+                }
+            }
+            partitionedBoundary.add(new short[] { xMin, xMax, yMin, (short) minDiffPos });
+            partitionedBoundary.add(new short[] { xMin, xMax, (short) minDiffPos, yMax });
+        }
+
+        return partitionedBoundary;
+    }
+
+    /**
+     * Bi-Partition the given boundary in p iterations.
+     * @param boundary The boundary of the bounding-box, the elements inside are defined as [xMin, xMax, yMin, yMax].
+     * @param pIter The partition iteration.
+     * @return The array of partitioned boundaries.
+     */
+    public List<short[]> biPartitionBoundaries(short[] boundary, int pIter, boolean vertical) {
+        ArrayDeque<short[]> partitionedBoundary = new ArrayDeque<>();
+        partitionedBoundary.add(boundary);
+        
+        for (int p = 0; p < pIter; p++) {
+            for (int i = 0, n = partitionedBoundary.size(); i < n; i++) {
+                short[] b = partitionedBoundary.poll();
+                short xMin = b[0];
+                short xMax = b[1];
+                short yMin = b[2];
+                short yMax = b[3];
+                short[] pba;
+                short[] pbb;
+                if (vertical) {
+                    short pos = (short) (xMin + (xMax - xMin) / 2);
+                    pba = new short[] { xMin, pos, yMin, yMax };
+                    pbb = new short[] { pos, xMax, yMin, yMax };
+
+                } else {
+                    short pos = (short) (yMin + (yMax - yMin) / 2);
+                    pba = new short[] { xMin, xMax, yMin, pos };
+                    pbb = new short[] { xMin, xMax, pos, yMax };
+                }
+                partitionedBoundary.add(pba);
+                partitionedBoundary.add(pbb);
+            }
+        }
+
+        return new ArrayList<>(partitionedBoundary);
+    }
+
+    /**
+     * Bi-Partition the given boundary in bi-tree shape.
+     * @param boundary The boundary of the bounding-box, the elements inside are defined as [xMin, xMax, yMin, yMax].
+     * @param pIter The partition iteration.
+     * @return The array of partitioned boundaries.
+     */
+    public List<short[]> biPartitionBoundariesRecur(short[] boundary, int pIter) {
+        List<short[]> partitionedBoundaries = new ArrayList<>();
+        partitionedBoundaries.add(boundary);
+        
+        for (int i = 0; i < pIter; i++) {
+            int start = (int)Math.pow(2, i    ) - 1;
+            int end   = (int)Math.pow(2, i + 1) - 1;
+            for (int j = start; j < end; j++) {
+                short[] baseBoundary = partitionedBoundaries.get(j);
+                List<short[]> biBoundary = biPartitionBoundaries(baseBoundary, 1, i % 2 == 0);
+                // List<short[]> biBoundary = partitionByLoadBalance(baseBoundary, i % 2 == 0);
+                partitionedBoundaries.addAll(biBoundary);
+            }
+        }
+
+        return partitionedBoundaries;
+    }
+
+    /**
+     * Classify the given connections according to the partitioned boundaries.
+     * @param graphs The subgraphs with its' boundary.
+     * @param connections The connections in the design.
+     * @return The classified connections with the same indexes in graph list.
+     */
+    public List<List<Connection>> classifyConnections(List<RouteNodeGraph> graphs, List<Connection> connections) {
+        List<List<Connection>> classifiedConnections = new ArrayList<>();
+        for (int i = 0; i < graphs.size(); i++) {
+            classifiedConnections.add(new ArrayList<>());
+        }
+
+        for (Connection connection : connections) {
+            boolean cutted = true;
+            for (int i = graphs.size() - 1; i > 0; i--) {
+                short[] b = graphs.get(i).getBoundary();
+                short xMinBB = connection.getXMinBB();
+                short xMaxBB = connection.getXMaxBB();
+                short yMinBB = connection.getYMinBB();
+                short yMaxBB = connection.getYMaxBB();
+                if (!isOutOfBoundary(b, xMinBB, yMinBB) && 
+                    !isOutOfBoundary(b, xMinBB, yMaxBB) && 
+                    !isOutOfBoundary(b, xMaxBB, yMinBB) && 
+                    !isOutOfBoundary(b, xMaxBB, yMaxBB)) {
+                    cutted = false;
+                    classifiedConnections.get(i).add(connection);
+                    connection.linkGraph(graphs.get(i));
+                    break;
+                }
+            }
+            if (cutted) {
+                classifiedConnections.get(0).add(connection);
+            }
+        }
+
+        return classifiedConnections;
+    }
+
+    /**
+     * Routes indirect connections async.
+     */
+    public void routeIndirectConnectionsAsync(RouteNodeGraph graph, List<Connection> connections,
+                                              int localConnectionsRouted, int localConnectionsRoutedIteration) {
+        
+        int routed = 0;
+        for (Connection connection : connections) {
+            if (shouldRoute(connection)) {
+                routed++;
+                routeConnection(graph, connection, localConnectionsRouted + routed);
+            }
+        }
+        connectionsRouted += routed;
+        connectionsRoutedIteration += routed;
+    }
+
+    /**
+     * Routes indirect connections recursively.
+     */
+    public void routeIndirectConnectionsRecur(List<RouteNodeGraph> graphs, List<List<Connection>> connections,
+                                              int localConnectionsRouted, int localConnectionsRoutedIteration,
+                                              int idx) {
+        
+        int baseIdx = idx;
+        int nextIdx1 = idx * 2 + 1;
+        int nextIdx2 = idx * 2 + 2;
+
+        routeIndirectConnectionsAsync(graphs.get(baseIdx), connections.get(baseIdx), localConnectionsRouted, localConnectionsRoutedIteration);
+        
+        CountUpDownLatch latch = new CountUpDownLatch();
+        for (int i = nextIdx1; i <= nextIdx2; i++) {
+            final int nextIdx = i;
+            if (nextIdx >= graphs.size() || connections.get(nextIdx).size() == 0)
+                break;
+            latch.countUp();
+            ParallelismTools.submit(() -> {
+                try {
+                    graphs.get(nextIdx).syncGraph(graphs.get(baseIdx));
+                    routeIndirectConnectionsRecur(graphs, connections, connectionsRouted, connectionsRoutedIteration, nextIdx);
+                    graphs.get(baseIdx).mergeGraph(graphs.get(nextIdx));
+                } catch (Throwable t) {
+                    t.printStackTrace();
+                    System.exit(1);
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
+        latch.await();
+    }
+
+    /**
      * Routes indirect connections iteratively.
      */
     public void routeIndirectConnections() {
-        sortConnections();
+        sortConnections(indirectConnections);
+        summaryConnectionPos(indirectConnections);
         initializeRouting();
         long lastIterationRnodeCount = 0;
         long lastIterationRnodeTime = 0;
+
+        // Generates subgraphs.
+        short[] routeBoundary = getDeviceBoundary();
+        List<short[]> partitionedBoundaries = biPartitionBoundariesRecur(routeBoundary, pIter);
+        List<RouteNodeGraph> graphs = new ArrayList<>();
+        graphs.add(routingGraph);
+        routingGraph.setBoundary(routeBoundary);
+        for (int i = 1; i < partitionedBoundaries.size(); i++) {
+            graphs.add(new RouteNodeGraph(routingGraph, partitionedBoundaries.get(i)));
+        }
+        
+        // Classifies connections by subgraphs' boarder.
+        List<List<Connection>> classifiedConnections = classifyConnections(graphs, indirectConnections);
 
         while (routeIteration < config.getMaxIterations()) {
             long startIteration = System.nanoTime();
@@ -858,28 +1106,64 @@ public class RWRoute{
             if (config.isTimingDriven()) {
                 setRerouteCriticality();
             }
-            for (Connection connection : sortedIndirectConnections) {
-                if (shouldRoute(connection)) {
-                    routeConnection(connection);
+
+            boolean noParallel = routeIteration >= 10 || (routeIteration >= 1 && overUsedRnodes.size() < 1000);
+            boolean noParallelFirst = true;
+
+            if (!noParallel) {
+                routeIndirectConnectionsRecur(graphs, classifiedConnections, connectionsRouted, connectionsRoutedIteration, 0);
+                if (routeIteration == 0) {
+                    boolean resort = false;
+                    for (int i = 1; i < classifiedConnections.size(); i++) {
+                        Iterator<Connection> it = classifiedConnections.get(i).iterator();
+                        while (it.hasNext()) {
+                            Connection connection = it.next();
+                            if (!connection.getSink().isRouted()) {
+                                connection.linkGraph(routingGraph);
+                                connection.resetRoute();
+                                classifiedConnections.get(0).add(connection);
+                                it.remove();
+                                resort = true;
+                            }
+                        }
+                    }
+                    if (resort) {
+                        sortConnections(classifiedConnections.get(0));
+                    }
                 }
+            } else {
+                if (noParallelFirst) {
+                    for (Connection connection : indirectConnections) {
+                        connection.linkGraph(routingGraph);
+                        connection.syncGraphPath(routingGraph);
+                    }
+                    noParallelFirst = false;
+                }
+                routeIndirectConnectionsAsync(routingGraph, indirectConnections, connectionsRouted, connectionsRoutedIteration);
             }
 
             updateCostFactors();
-
-            rnodesCreatedThisIteration = routingGraph.numNodes() - lastIterationRnodeCount;
-            List<Connection> unroutableConnections = getUnroutableConnections();
             boolean needsResorting = false;
+            rnodesCreatedThisIteration = routingGraph.numNodes() - lastIterationRnodeCount;
+            List<Connection> unroutableConnections = getUnroutableConnections(indirectConnections);
             for (Connection connection : unroutableConnections) {
-                System.out.printf("CRITICAL WARNING: Unroutable connection in iteration #%d\n", routeIteration);
-                System.out.println("                 " + connection);
                 needsResorting = handleUnroutableConnection(connection) || needsResorting;
             }
+
             rnodesCreatedThisIteration = routingGraph.numNodes() - lastIterationRnodeCount;
-            for (Connection connection : getCongestedConnections()) {
+            List<Connection> congestedConnections = new ArrayList<>();
+            for (List<Connection> connections : classifiedConnections) {
+                congestedConnections.addAll(getCongestedConnections(connections));
+            }
+            for (Connection connection : congestedConnections) {
                 needsResorting = handleCongestedConnection(connection) || needsResorting;
             }
+
             if (needsResorting) {
-                sortConnections();
+                sortConnections(indirectConnections);
+                for (List<Connection> connections : classifiedConnections) {
+                    sortConnections(connections);
+                }
             }
 
             if (config.isTimingDriven()) {
@@ -903,9 +1187,14 @@ public class RWRoute{
             lastIterationRnodeCount = routingGraph.numNodes();
             lastIterationRnodeTime = rnodesTimer.getTime();
         }
+        for (int i = 0; i < classifiedConnections.size(); i++) {
+            for (Connection connection : classifiedConnections.get(i)) {
+                connection.syncGraphPath(routingGraph);
+            }
+        }
         if (routeIteration == config.getMaxIterations()) {
-            System.out.println("\nERROR: Routing terminated after " + (routeIteration -1 ) + " iterations.");
-            System.out.println("       Unroutable connections: " + getUnroutableConnections().size());
+            System.out.println("\nERROR: Routing terminated after " + (routeIteration - 1) + " iterations.");
+            System.out.println("       Unroutable connections: " + getUnroutableConnections(indirectConnections).size());
             System.out.println("       Conflicting nodes: " + overUsedRnodes.size());
             for (RouteNode rnode : overUsedRnodes) {
                 System.out.println("              " + rnode);
@@ -917,9 +1206,9 @@ public class RWRoute{
      * Gets unrouted connections.
      * @return A list of unrouted connections.
      */
-    private List<Connection> getUnroutableConnections() {
+    private List<Connection> getUnroutableConnections(List<Connection> connections) {
         List<Connection> unroutedConnections = new ArrayList<>();
-        for (Connection connection : sortedIndirectConnections) {
+        for (Connection connection : connections) {
             if (!connection.getSink().isRouted()) {
                 unroutedConnections.add(connection);
             }
@@ -927,9 +1216,13 @@ public class RWRoute{
         return unroutedConnections;
     }
 
-    private List<Connection> getCongestedConnections() {
+    /**
+     * Gets congested connections.
+     * @return A list of congested connections.
+     */
+    private List<Connection> getCongestedConnections(List<Connection> connections) {
         List<Connection> congestedConnections = new ArrayList<>();
-        for (Connection connection : sortedIndirectConnections) {
+        for (Connection connection : connections) {
             if (connection.isCongested()) {
                 congestedConnections.add(connection);
             }
@@ -969,6 +1262,60 @@ public class RWRoute{
             LUTTools.swapMultipleLutPins(pinSwaps);
         }
 
+        if (lutRoutethru) {
+            // It is possible for RWRoute to routethru a LUT that is already being used as a
+            // static source through its *MUX output. By default, the 6LUT is used for this supply.
+            // When LUT routethru-s are considered, examine both static nets to find
+            // any cases where the *MUX output pin is used as a static source alongside
+            // the *_O output being used as a routethru. In such cases, configure the
+            // OUTMUX* site PIP to source from the 5LUT rather than the default 6LUT
+            // so that no conflict occurs
+            for (Net staticNet : Arrays.asList(design.getGndNet(), design.getVccNet())) {
+                for (SitePinInst spi : staticNet.getPins()) {
+                    if (!spi.isOutPin()) {
+                        continue;
+                    }
+                    SiteInst si = spi.getSiteInst();
+                    if (!Utils.isSLICE(si)) {
+                        continue;
+                    }
+
+                    String pinName = spi.getName();
+                    if (!pinName.endsWith("MUX")) {
+                        continue;
+                    }
+
+                    Node muxNode = spi.getConnectedNode();
+                    assert(routingGraph.getPreservedNet(muxNode) == staticNet);
+
+                    Site site = si.getSite();
+                    char lutLetter = pinName.charAt(0);
+                    Node oNode = site.getConnectedNode(lutLetter + "_O");
+                    RouteNode rnode = routingGraph.getNode(oNode);
+                    if (rnode == null || rnode.getOccupancy() == 0) {
+                        // No LUT6 routethru, nothing to be done
+                        continue;
+                    }
+
+                    if (pinName.charAt(1) == '6') {
+                        throw new RuntimeException("ERROR: Illegal LUT routethru on " + site + "/" + pinName +
+                                " since the 5LUT is being used as a static source");
+                    }
+
+                    // Perform intra-site routing back to the LUT5 to not conflict with LUT6 routethru
+                    BEL outmux = si.getBEL("OUTMUX" + lutLetter);
+                    si.routeIntraSiteNet(staticNet, outmux.getPin("D5"), outmux.getPin("OUT"));
+
+                    if (si.getDesign() == null) {
+                        // Rename SiteInst (away from "STATIC_SOURCE_<siteName>") and
+                        // attach it to the design so that intra-site routing updates take effect
+                        si.setName(site.getName());
+                        design.addSiteInst(si);
+                    }
+                }
+            }
+        }
+
         assignNodesToConnections();
 
         // fix routes with cycles and / or multi-driver nodes
@@ -982,8 +1329,6 @@ public class RWRoute{
             SitePinInst altSource = net.getAlternateSource();
             SiteInst si = source.getSiteInst();
             boolean altSourcePreviouslyRouted = altSource != null ? altSource.isRouted() : false;
-            assert(source != null);
-            boolean sourcePreviouslyRouted = source.isRouted();
             for (SitePinInst spi : Arrays.asList(source, altSource)) {
                 if (spi != null) {
                     spi.setRouted(false);
@@ -1026,33 +1371,15 @@ public class RWRoute{
                     break;
                 }
             }
-
             // If the alt source was previously routed, and is no longer, let's remove it
             if (altSource != null && altSourcePreviouslyRouted && !altSource.isRouted()) {
-                // If altSource is not routed, then source must be routed
-                assert(source.isRouted());
+                boolean sourceRouted = source.isRouted();
                 altSource.getSiteInst().removePin(altSource);
-                net.removePin(altSource, true);
-                assert(source.isRouted());
-                if (source.getName().endsWith("MUX")) {
-                    assert(altSource.getName().endsWith("_O"));
+                net.removePin(altSource);
+                source.setRouted(sourceRouted);
+                if (altSource.getName().endsWith("_O") && source.getName().endsWith("MUX") && source.isRouted()) {
                     // Add site routing back if we are keeping the MUX pin
-                    si.routeIntraSiteNet(net, altSource.getBELPin(), altSource.getBELPin());
-                }
-            }
-            // If the original source was routed and is now no longer used, it must
-            // mean that the alternate source is used instead. Let's remove the main
-            // source which will promote the alternate to main.
-            if (sourcePreviouslyRouted && !source.isRouted()) {
-                assert(altSource != null && altSource.isRouted());
-                net.removePin(source, true);
-                assert(net.getSource() == altSource);
-                assert(net.getAlternateSource() == null);
-                assert(altSource.isRouted());
-                if (source.getName().endsWith("_O")) {
-                    assert(altSource.getName().endsWith("MUX"));
-                    // Add site routing back if we are keeping the MUX pin
-                    si.routeIntraSiteNet(net, source.getBELPin(), source.getBELPin());
+                    source.getSiteInst().routeIntraSiteNet(net, altSource.getBELPin(), altSource.getBELPin());
                 }
             }
         }
@@ -1064,7 +1391,7 @@ public class RWRoute{
      * @return true, if the connection should be routed.
      */
     protected boolean shouldRoute(Connection connection) {
-        if (routeIteration > 1) {
+        if (routeIteration >= 1) {
             if (connection.getCriticality() > minRerouteCriticality) {
                 return true;
             }
@@ -1109,7 +1436,7 @@ public class RWRoute{
         timingWeight = Math.min(timingWeight * config.getTimingMultiplier(), 1f);
         oneMinusTimingWeight = 1 - timingWeight;
         maxDelayAndTimingVertex = timingManager.calculateArrivalRequiredTimes();
-        timingManager.calculateCriticality(sortedIndirectConnections,
+        timingManager.calculateCriticality(indirectConnections,
                 MAX_CRITICALITY, config.getCriticalityExponent());
         updateTimingTimer.stop();
     }
@@ -1120,7 +1447,7 @@ public class RWRoute{
      */
     private void updateTimingAfterFixingRoutes(Set<NetWrapper> netsWithIllegalRoutes) {
         timingManager.updateIllegalNetsDelays(netsWithIllegalRoutes, nodesDelays);
-        timingManager.patchUpDelayOfConnections(sortedIndirectConnections);
+        timingManager.patchUpDelayOfConnections(indirectConnections);
         updateTiming();
     }
 
@@ -1170,10 +1497,8 @@ public class RWRoute{
     /**
      * Sorts indirect connections for routing.
      */
-    private void sortConnections() {
-        sortedIndirectConnections.clear();
-        sortedIndirectConnections.addAll(indirectConnections);
-        sortedIndirectConnections.sort((connection1, connection2) -> {
+    private void sortConnections(List<Connection> connections) {
+        connections.sort((connection1, connection2) -> {
             int comp = connection2.getNetWrapper().getConnections().size() - connection1.getNetWrapper().getConnections().size();
             if (comp == 0) {
                 return Short.compare(connection1.getHpwl(), connection2.getHpwl());
@@ -1462,7 +1787,8 @@ public class RWRoute{
      * Routes a connection.
      * @param connection The connection to route.
      */
-    protected void routeConnection(Connection connection) {
+    protected void routeConnection(RouteNodeGraph graph, Connection connection, int localConnectionsRouted) {
+        PriorityQueue<RouteNode> queue = new PriorityQueue<>();
         float rnodeCostWeight = 1 - connection.getCriticality();
         float shareWeight = (float) (Math.pow(rnodeCostWeight, config.getShareExponent()));
         float rnodeWLWeight = rnodeCostWeight * oneMinusWlWeight;
@@ -1470,8 +1796,8 @@ public class RWRoute{
         float dlyWeight = connection.getCriticality() * oneMinusTimingWeight / 100f;
         float estDlyWeight = connection.getCriticality() * timingWeight;
 
-        prepareRouteConnection(connection, shareWeight, rnodeCostWeight,
-                rnodeWLWeight, estWlWeight, dlyWeight, estDlyWeight);
+        prepareRouteConnection(queue, connection, shareWeight, rnodeCostWeight,
+                rnodeWLWeight, estWlWeight, dlyWeight, estDlyWeight, localConnectionsRouted);
 
         int nodesPoppedThisConnection = 0;
         RouteNode rnode;
@@ -1480,8 +1806,8 @@ public class RWRoute{
             if (rnode.isTarget()) {
                 break;
             }
-            exploreAndExpand(rnode, connection, shareWeight, rnodeCostWeight,
-                    rnodeWLWeight, estWlWeight, dlyWeight, estDlyWeight);
+            exploreAndExpand(graph, queue, rnode, connection, shareWeight, rnodeCostWeight,
+                    rnodeWLWeight, estWlWeight, dlyWeight, estDlyWeight, localConnectionsRouted);
         }
         nodesPushed += nodesPoppedThisConnection + queue.size();
         nodesPopped += nodesPoppedThisConnection;
@@ -1509,7 +1835,7 @@ public class RWRoute{
             }
         }
 
-        routingGraph.resetExpansion();
+        graph.resetExpansion();
     }
 
     /**
@@ -1571,6 +1897,9 @@ public class RWRoute{
             connection.getSink().setRouted(routed);
             updateUsersAndPresentCongestionCost(connection);
         } else {
+            if (routeIteration > 1) {
+                System.out.println(connection + "not routed.");
+            }
             connection.resetRoute();
         }
     }
@@ -1601,6 +1930,9 @@ public class RWRoute{
 
         List<RouteNode> rnodes = connection.getRnodes();
         if (rnodes.size() == 1) {
+            if (routeIteration > 1) {
+                System.out.println("Didn't backtrack to alternate source either -- invalid routing");
+            }
             // No prev pointer from sink rnode -> not routed
             return false;
         }
@@ -1608,6 +1940,7 @@ public class RWRoute{
         RouteNode sourceRnode = rnodes.get(rnodes.size()-1);
         if (!sourceRnode.equals(connection.getSourceRnode())) {
             if (!sourceRnode.equals(connection.getAltSourceRnode())) {
+                System.out.println("Didn't backtrack to alternate source either -- invalid routing");
                 // Didn't backtrack to alternate source either -- invalid routing
                 return false;
             }
@@ -1647,20 +1980,23 @@ public class RWRoute{
      * @param rnodeDelayWeight The weight of childRnode's exact delay.
      * @param rnodeEstDlyWeight The weight of estimated delay to the target.
      */
-    private void exploreAndExpand(RouteNode rnode, Connection connection, float shareWeight, float rnodeCostWeight,
+    private void exploreAndExpand(RouteNodeGraph graph, PriorityQueue<RouteNode> queue,
+                                  RouteNode rnode, Connection connection,
+                                  float shareWeight, float rnodeCostWeight,
                                   float rnodeLengthWeight, float rnodeEstWlWeight,
-                                  float rnodeDelayWeight, float rnodeEstDlyWeight) {
-        boolean longParent = config.isTimingDriven() && DelayEstimatorBase.isLong(rnode);
+                                  float rnodeDelayWeight, float rnodeEstDlyWeight,
+                                  int localConnectionsRouted) {
+        boolean longParent = config.isTimingDriven() && DelayEstimatorBase.isLong(rnode.getNode());
         for (RouteNode childRNode:rnode.getChildren()) {
             // Targets that are visited more than once must be overused
-            assert(!childRNode.isTarget() || !childRNode.isVisited(connectionsRouted) || childRNode.willOverUse(connection.getNetWrapper()));
+            assert(!childRNode.isTarget() || !childRNode.isVisited(localConnectionsRouted) || childRNode.willOverUse(connection.getNetWrapper()));
 
             // If childRnode is preserved, then it must be preserved for the current net we're routing
             Net preservedNet;
-            assert((preservedNet = routingGraph.getPreservedNet(childRNode)) == null ||
+            assert((preservedNet = graph.getPreservedNet(childRNode.getNode())) == null ||
                     preservedNet == connection.getNetWrapper().getNet());
 
-            if (childRNode.isVisited(connectionsRouted)) {
+            if (childRNode.isVisited(localConnectionsRouted)) {
                 // Node must be in queue already.
 
                 // Note: it is possible this is a cheaper path to childRNode; however, because the
@@ -1683,7 +2019,7 @@ public class RWRoute{
                 }
 
                 if (earlyTermination) {
-                    assert(!childRNode.isVisited(connectionsRouted));
+                    assert(!childRNode.isVisited(localConnectionsRouted));
                     nodesPushed += queue.size();
                     queue.clear();
                 }
@@ -1693,7 +2029,7 @@ public class RWRoute{
                 }
                 switch (childRNode.getType()) {
                     case WIRE:
-                        if (!routingGraph.isAccessible(childRNode, connection)) {
+                        if (!graph.isAccessible(childRNode, connection)) {
                             continue;
                         }
                         if (!config.isUseUTurnNodes() && childRNode.getDelay() > 10000) {
@@ -1705,7 +2041,7 @@ public class RWRoute{
                     case PINBOUNCE:
                         // A PINBOUNCE can only be a target if this connection has an alternate sink
                         assert(!childRNode.isTarget() || connection.getAltSinkRnodes().isEmpty());
-                        if (!isAccessiblePinbounce(childRNode, connection)) {
+                        if (!isAccessiblePinbounce(childRNode, connection, graph)) {
                             continue;
                         }
                         break;
@@ -1730,8 +2066,8 @@ public class RWRoute{
                 }
             }
 
-            evaluateCostAndPush(rnode, longParent, childRNode, connection, shareWeight, rnodeCostWeight,
-                    rnodeLengthWeight, rnodeEstWlWeight, rnodeDelayWeight, rnodeEstDlyWeight);
+            evaluateCostAndPush(graph, queue, rnode, longParent, childRNode, connection, shareWeight, rnodeCostWeight,
+                    rnodeLengthWeight, rnodeEstWlWeight, rnodeDelayWeight, rnodeEstDlyWeight, localConnectionsRouted);
             if (childRNode.isTarget() && queue.size() == 1) {
                 // Target is uncongested and the only thing in the (previously cleared) queue, abandon immediately
                 break;
@@ -1755,10 +2091,10 @@ public class RWRoute{
      * @param connection The connection to route.
      * @return true, if the PINBOUNCE rnode is in the same column as the target and within one INT tile of the target.
      */
-    protected boolean isAccessiblePinbounce(RouteNode child, Connection connection) {
+    protected boolean isAccessiblePinbounce(RouteNode child, Connection connection, RouteNodeGraph graph) {
         assert(child.getType() == RouteNodeType.PINBOUNCE);
 
-        return routingGraph.isAccessible(child, connection);
+        return graph.isAccessible(child, connection);
     }
 
     protected boolean isAccessiblePinfeedI(RouteNode child, Connection connection) {
@@ -1775,7 +2111,7 @@ public class RWRoute{
         }
 
         if (child.countConnectionsOfUser(connection.getNetWrapper()) == 0 ||
-            child.getIntentCode() != IntentCode.NODE_PINBOUNCE) {
+                child.getNode().getIntentCode() != IntentCode.NODE_PINBOUNCE) {
             // Inaccessible if child is not a sink pin of another connection on the same
             // net, or it is not a PINBOUNCE node
             return false;
@@ -1797,9 +2133,12 @@ public class RWRoute{
      * @param rnodeDelayWeight The weight of childRnode's exact delay.
      * @param rnodeEstDlyWeight The weight of estimated delay from childRnode to the target.
      */
-    protected void evaluateCostAndPush(RouteNode rnode, boolean longParent, RouteNode childRnode, Connection connection, float sharingWeight, float rnodeCostWeight,
+    protected void evaluateCostAndPush(RouteNodeGraph graph, PriorityQueue<RouteNode> queue, RouteNode rnode, boolean longParent,
+                                       RouteNode childRnode, Connection connection,
+                                       float sharingWeight, float rnodeCostWeight,
                                        float rnodeLengthWeight, float rnodeEstWlWeight,
-                                       float rnodeDelayWeight, float rnodeEstDlyWeight) {
+                                       float rnodeDelayWeight, float rnodeEstDlyWeight,
+                                       int localConnectionsRouted) {
         int countSourceUses = childRnode.countConnectionsOfUser(connection.getNetWrapper());
         float sharingFactor = 1 + sharingWeight* countSourceUses;
 
@@ -1834,8 +2173,8 @@ public class RWRoute{
                 }
 
                 // Account for any detours that must be taken to get to and back from the closest Laguna column
-                int nextLagunaColumn = routingGraph.nextLagunaColumn[childX];
-                int prevLagunaColumn = routingGraph.prevLagunaColumn[childX];
+                int nextLagunaColumn = graph.nextLagunaColumn[childX];
+                int prevLagunaColumn = graph.prevLagunaColumn[childX];
                 int nextLagunaColumnDist = Math.abs(nextLagunaColumn - childX);
                 int prevLagunaColumnDist = Math.abs(prevLagunaColumn - childX);
                 if (sinkX >= childX) {
@@ -1863,7 +2202,7 @@ public class RWRoute{
         if (config.isTimingDriven()) {
             newTotalPathCost += rnodeEstDlyWeight * (deltaX * 0.32 + deltaY * 0.16);
         }
-        push(childRnode, newPartialPathCost, newTotalPathCost);
+        push(queue, childRnode, newPartialPathCost, newTotalPathCost, localConnectionsRouted);
     }
 
     /**
@@ -1903,13 +2242,13 @@ public class RWRoute{
      * @param newPartialPathCost The upstream path cost from childRnode to the source.
      * @param newTotalPathCost Total path cost of childRnode.
      */
-    protected void push(RouteNode childRnode, float newPartialPathCost, float newTotalPathCost) {
+    protected void push(PriorityQueue<RouteNode> queue, RouteNode childRnode, float newPartialPathCost, float newTotalPathCost, int localConnectionsRouted) {
         assert(childRnode.getPrev() != null || childRnode.getType() == RouteNodeType.PINFEED_O);
         childRnode.setLowerBoundTotalPathCost(newTotalPathCost);
         childRnode.setUpstreamPathCost(newPartialPathCost);
         // Use the number-of-connections-routed-so-far as the identifier for whether a rnode
         // has been visited by this connection before
-        childRnode.setVisited(connectionsRouted);
+        childRnode.setVisited(localConnectionsRouted);
         queue.add(childRnode);
     }
 
@@ -1926,14 +2265,16 @@ public class RWRoute{
      * @param rnodeDelayWeight The weight of childRnode's exact delay.
      * @param rnodeEstDlyWeight The weight of estimated delay to the target.
      */
-    protected void prepareRouteConnection(Connection connectionToRoute, float shareWeight, float rnodeCostWeight,
+    protected void prepareRouteConnection(PriorityQueue<RouteNode> queue, Connection connectionToRoute,
+                                          float shareWeight, float rnodeCostWeight,
                                           float rnodeLengthWeight, float rnodeEstWlWeight,
-                                          float rnodeDelayWeight, float rnodeEstDlyWeight) {
+                                          float rnodeDelayWeight, float rnodeEstDlyWeight,
+                                          int localConnectionsRouted) {
         // Rips up the connection
         ripUp(connectionToRoute);
 
-        connectionsRouted++;
-        connectionsRoutedIteration++;
+        // connectionsRouted++;
+        // connectionsRoutedIteration++;
         assert(queue.isEmpty());
 
         // Sets the sink rnode(s) of the connection as the target(s)
@@ -1942,7 +2283,7 @@ public class RWRoute{
         // Adds the source rnode to the queue
         RouteNode sourceRnode = connectionToRoute.getSourceRnode();
         assert(sourceRnode.getPrev() == null);
-        push(sourceRnode, 0, 0);
+        push(queue, sourceRnode, 0, 0, localConnectionsRouted);
     }
 
     /**
@@ -1989,7 +2330,7 @@ public class RWRoute{
     }
 
     private void printTimingInfo() {
-        if (sortedIndirectConnections.size() > 0) {
+        if (indirectConnections.size() > 0) {
             timingManager.getCriticalPathInfo(maxDelayAndTimingVertex, false, routingGraph);
         }
     }

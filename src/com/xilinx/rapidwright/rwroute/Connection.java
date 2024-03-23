@@ -98,6 +98,45 @@ public class Connection implements Comparable<Connection>{
         crossSLR = !source.getTile().getSLR().equals(sink.getTile().getSLR());
     }
 
+    public void linkGraph(RouteNodeGraph graph) {
+        if (sourceRnode != null) {
+            this.setSourceRnode(
+                    graph.getOrCreate(
+                            sourceRnode.getNode(),
+                            sourceRnode.getType()));
+        }
+        if (altSourceRnode != null) {
+            this.setAltSourceRnode(
+                    graph.getOrCreate(
+                            altSourceRnode.getNode(),
+                            altSourceRnode.getType()));
+        }
+        if (sinkRnode != null) {
+            this.setSinkRnode(
+                    graph.getOrCreate(
+                            sinkRnode.getNode(),
+                            sinkRnode.getType()));
+        }
+        if (altSinkRnodes != null) {
+            for (int i = 0; i < altSinkRnodes.size(); i++) {
+                RouteNode altSinkRnode = altSinkRnodes.get(i);
+                altSinkRnodes.set(i, graph.getOrCreate(
+                        altSinkRnode.getNode(),
+                        altSinkRnode.getType()));
+            }
+        }
+        
+    }
+
+    public void syncGraphPath(RouteNodeGraph graph) {
+        if (!rnodes.isEmpty() && sink.isRouted()) {
+            for (int i = 0; i < rnodes.size(); i++) {
+                RouteNode rnode = rnodes.get(i);
+                rnodes.set(i, graph.getOrCreate(rnode.getNode(), rnode.getType()));
+            }
+        }
+    }
+
     /**
      * Computes the half-perimeter wirelength of connection based on the source and sink rnodes.
      */

@@ -112,6 +112,27 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
         flags = 0;
     }
 
+    public void updateFrom(RouteNode rnode, RouteNodeGraph thisGraph) {
+        // children = null;
+        this.baseCost = rnode.getBaseCost();
+        this.presentCongestionCost = rnode.getPresentCongestionCost();
+        this.historicalCongestionCost = rnode.getHistoricalCongestionCost();
+        this.upstreamPathCost = rnode.getUpstreamPathCost();
+        this.lowerBoundTotalPathCost = rnode.getLowerBoundTotalPathCost();
+        if (rnode.getUsersConnectionCounts() != null) {
+            usersConnectionCounts = rnode.getUsersConnectionCounts();
+        }
+        if (rnode.getDriversCounts() != null) {
+            driversCounts = rnode.getDriversCounts();
+        }
+        if (rnode.getPrev() != null) {
+            RouteNode thatPrevRnode = rnode.getPrev();
+            this.prev = thisGraph.getOrCreate(thatPrevRnode.getNode(), thatPrevRnode.getType());
+        }
+        visited = rnode.getVisited();
+        flags = rnode.getFlags();
+    }
+
     @Override
     public int compareTo(RouteNode that) {
         // Do not use Float.compare() since it also compares NaN, which we'll assume is unreachable
@@ -121,7 +142,7 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
 
     abstract protected RouteNode getOrCreate(Node node, RouteNodeType type);
 
-    protected void setChildren(RuntimeTracker setChildrenTimer) {
+    protected void setChildren(RuntimeTracker setChildrenTimer, short[] boundary, Map<Tile, BitSet> lagunaI) {
         if (children != null)
             return;
         setChildrenTimer.start();
@@ -131,7 +152,12 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
             if (isExcluded(downhill)) {
                 continue;
             }
-
+            RouteNodeInfo nodeInfo = RouteNodeInfo.get(this, lagunaI);
+            short x = nodeInfo.endTileXCoordinate;
+            short y = nodeInfo.endTileYCoordinate;
+            if (x < boundary[0] || x >= boundary[1] || y < boundary[2] || y >= boundary[3]) {
+                continue;
+            }
             RouteNode child = getOrCreate(downhill, null);
             childrenList.add(child);//the sink rnode of a target connection has been created up-front
         }
@@ -411,6 +437,14 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
     }
 
     /**
+     * Gets the children array.
+     * @return A list of RouteNode Objects.
+     */
+    public RouteNode[] getChildrenArray() {
+        return children;
+    }
+
+    /**
      * Gets the children of a RouteNode Object.
      * @return A list of RouteNode Objects.
      */
@@ -526,6 +560,14 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
     }
 
     /**
+     * Gets the drivers counts.
+     * @return The drivers counts.
+     */
+    public Map<RouteNode, Integer> getDriversCounts() {
+        return driversCounts;
+    }
+
+    /**
      * Gets the number of unique drivers.
      * @return The number of unique drivers of a rnode, i.e., the key set size of the driver map
      */
@@ -629,6 +671,14 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
     }
 
     /**
+     * Gets the visited id.
+     * @return The visited id.
+     */
+    public int getVisited() {
+        return visited;
+    }
+
+    /**
      * Checks if a RouteNode instance has been visited by a specific integer identifier.
      * @param id Integer identifier.
      * @return true, if a RouteNode instance has been visited before.
@@ -679,6 +729,14 @@ abstract public class RouteNode extends Node implements Comparable<RouteNode> {
     abstract public boolean isExcluded(Node child);
 
     abstract public int getSLRIndex();
+
+    /**
+     * Gets the flags.
+     * @return The flags.
+     */
+    public byte getFlags() {
+        return flags;
+    } 
 
     /**
      * @param index Bit index.
